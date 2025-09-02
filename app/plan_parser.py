@@ -1,48 +1,76 @@
-import cv2, numpy as np
-from shapely.geometry import LineString
-from shapely.ops import polygonize
-from PIL import Image
-import io
+# app/plan_parser.py
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple, Optional
 
-def _bytes_to_gray(image_bytes: bytes):
-    arr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        pil = Image.open(io.BytesIO(image_bytes)).convert("L")
-        img = np.array(pil)
-    return img
+import numpy as np
+import cv2
 
-def parse_plan_image(image_bytes: bytes, known_scale_mm_per_px: float | None = None) -> dict:
-    img = _bytes_to_gray(image_bytes)
-    h, w = img.shape[:2]
 
-    # 1) контуры
-    edges = cv2.Canny(cv2.GaussianBlur(img, (3,3), 0), 50, 150, apertureSize=3)
+def _dedup_segments(segments: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+    """
+    Грубое удаление дублей: квантование координат.
+    """
+    seen = set()
+    out = []
+    for x1, y1, x2, y2 in segments:
+        key = (int(round(x1 / 2)), int(round(y1 / 2)), int(round(x2 / 2)), int(round(y2 / 2)))
+        if key not in seen:
+            seen.add(key)
+            out.append((x1, y1, x2, y2))
+    return out
 
-    # 2) линии (стены)
+
+def parse_plan_image(mask_or_bytes: np.ndarray, known_scale_mm_per_px: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Принимает бинарную маску (2D np.uint8): 0 – линии, 255 – фон.
+    Возвращает {image_size, scale, walls, rooms[]}.
+    """
+    if mask_or_bytes.ndim != 2:
+        raise ValueError("Ожидалась бинарная маска 2D (0 – линии, 255 – фон)")
+
+    mask = mask_or_bytes
+    H, W = mask.shape
+    edges = cv2.Canny(255 - mask, 50, 150)
+
+    # параметры Hough зависят от размера
+    min_len = max(40, min(W, H) // 25)
+    max_gap = max(5, min(W, H) // 150)
+
     lines = cv2.HoughLinesP(
-        edges, rho=1, theta=np.pi/180, threshold=70,
-        minLineLength=int(min(w, h)*0.05), maxLineGap=5
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=min_len,
+        maxLineGap=max_gap,
     )
-    wall_lines = []
+
+    segs: List[Tuple[int, int, int, int]] = []
     if lines is not None:
-        for (x1,y1,x2,y2) in lines[:,0,:]:
-            wall_lines.append(((int(x1),int(y1)), (int(x2),int(y2))))
+        for l in lines[:, 0, :]:
+            x1, y1, x2, y2 = map(int, l.tolist())
+            # фильтр: почти горизонтальные/вертикальные
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+            if dx < 2 and dy < 2:
+                continue
+            if dx >= dy and dy > 0:
+                slope = dy / float(dx)
+                if slope > 0.1:
+                    continue
+            if dy > dx and dx > 0:
+                slope = dx / float(dy)
+                if slope > 0.1:
+                    continue
+            segs.append((x1, y1, x2, y2))
 
-    # 3) полигоны (примерные комнаты)
-    shapely_lines = [LineString([p1, p2]) for p1, p2 in wall_lines]
-    rooms = []
-    if shapely_lines:
-        for poly in polygonize(shapely_lines):
-            if poly.area > (w*h)*0.002:
-                coords = [(int(x), int(y)) for x, y in list(poly.exterior.coords)[:-1]]
-                rooms.append(coords)
+    segs = _dedup_segments(segs)
 
-    mm_per_px = known_scale_mm_per_px or 1.0
+    walls = [{"p1": [x1, y1], "p2": [x2, y2]} for (x1, y1, x2, y2) in segs]
 
-    return {
-        "image_size": {"w_px": int(w), "h_px": int(h)},
-        "scale": {"mm_per_px": float(mm_per_px)},
-        "walls": [{"p1": [p1[0], p1[1]], "p2": [p2[0], p2[1]]} for p1, p2 in wall_lines],
-        "rooms": [{"id": f"room_{i+1}", "polygon": poly} for i, poly in enumerate(rooms)]
+    plan: Dict[str, Any] = {
+        "image_size": {"w_px": int(W), "h_px": int(H)},
+        "scale": {"mm_per_px": float(known_scale_mm_per_px) if known_scale_mm_per_px else None},
+        "walls": walls,
+        "rooms": [],
     }
+    return plan

@@ -1,24 +1,31 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-*.egg
 *.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
 
 # venv
 .venv/
 venv/
+ENV/
 
-# OS / IDE
+# OS / editors
 .DS_Store
 .idea/
 .vscode/
+*.swp
 
-# env/секреты
-.env
-.env.*
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
-# данные/артефакты
+# Logs
 *.log
-*.tmp
-*.cache
+
+# Local data
+.env

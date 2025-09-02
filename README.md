@@ -1,11 +1,12 @@
 # Home Design Backend
 
-FastAPI сервис: парсинг планов квартир из PDF/JPG/PNG, калибровка масштаба, нормализация, SVG, измерения стен и площадей.
+FastAPI-сервис для парсинга планов квартир из изображений/PDF, калибровки масштаба, нормализации и экспорта в SVG.
 
-## Запуск
+## Локальный запуск
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+python -m uvicorn app.main:app --reload
 ```
