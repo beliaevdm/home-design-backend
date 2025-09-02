@@ -1,68 +1,124 @@
-# app/ml/detector.py
+# ml/detector.py
 from __future__ import annotations
+
+import io
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Tuple, Dict, Any, List
 
 import numpy as np
-
-try:
-    from ultralytics import YOLO
-except Exception as e:
-    raise RuntimeError(
-        "Ultralytics (YOLOv8) is required. Make sure 'ultralytics' is in requirements.txt and installed."
-    ) from e
+from PIL import Image
+import cv2  # ultralytics рисует в BGR, так удобнее кодировать PNG
+from ultralytics import YOLO
 
 
-CLASS_COLORS = {
-    # базовые цвета для отрисовки (BGR)
-    "door": (0, 165, 255),    # оранжевый
-    "window": (255, 191, 0),  # голубой (в BGR это желто-голубой, но норм)
-    "wall": (0, 0, 255),      # красный (как ориентир)
-}
+class PlanDetector:
+    """
+    Обёртка над YOLOv8 для детекции элементов на планах квартир.
+    - загружает веса из models/floorplan_yolov8.pt (по умолчанию)
+    - принимает PDF/JPG/PNG как байты (для PDF нужен внешний препроцесс; здесь работаем с изображениями)
+    - возвращает: (annotated_png_bytes, detections_json)
+    """
 
-class FloorPlanDetector:
-    def __init__(self, weights_path: str = "app/models/floorplan_yolov8.pt", device: Optional[str] = None):
-        p = Path(weights_path)
-        if not p.exists():
+    def __init__(self, model_path: str | Path | None = None) -> None:
+        if model_path is None:
+            # ml/detector.py -> .. (root) / models / floorplan_yolov8.pt
+            root = Path(__file__).resolve().parents[1]
+            model_path = root / "models" / "floorplan_yolov8.pt"
+
+        self.model_path = Path(model_path)
+        if not self.model_path.exists():
             raise FileNotFoundError(
-                f"Weights not found: {p}. Put your YOLOv8 weights to this path."
+                f"Не найден файл весов YOLO: {self.model_path}\n"
+                f"Положи модель в {self.model_path} (имя: floorplan_yolov8.pt)."
             )
-        # device=None -> сам выберет (CPU на Mac — ок)
-        self.model = YOLO(str(p))
-        self.names = self.model.names  # словарь id->имя класса
 
-    def detect(self, img_bgr: np.ndarray, conf: float = 0.3, imgsz: int = 1280) -> List[Dict[str, Any]]:
+        # Загружаем модель один раз
+        self.model = YOLO(str(self.model_path))
+
+        # Если в весах сохранена своя карта классов — возьмём её
+        # Иначе — используем дефолтные имена
+        try:
+            names = self.model.names  # dict or list
+            if isinstance(names, dict):
+                # {0: 'wall', 1: 'door', ...}
+                self.class_names = [names[k] for k in sorted(names)]
+            else:
+                self.class_names = list(names)
+        except Exception:
+            self.class_names = [
+                "wall", "door", "window", "column", "stair", "text", "other"
+            ]
+
+    # ---------- utils ----------
+
+    @staticmethod
+    def _bytes_to_bgr(data: bytes) -> np.ndarray:
         """
-        Возвращает список детекций:
-        [{ 'cls_id': int, 'cls_name': str, 'score': float, 'xyxy': [x1,y1,x2,y2] }, ...]
+        Надёжно превращаем входные байты в BGR-изображение (H, W, 3).
+        Работает для PNG/JPG. Для PDF используй препроцесс в app.preprocess (в /render).
         """
-        # YOLO ожидает RGB
-        img_rgb = img_bgr[..., ::-1]
-        results = self.model.predict(
-            source=img_rgb,
-            conf=conf,
-            imgsz=imgsz,
-            verbose=False,
-            device=None,
-        )
-        out: List[Dict[str, Any]] = []
+        # Через PIL (надёжнее, чем imdecode на разном контенте)
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        arr = np.array(img)  # RGB
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        return bgr
+
+    @staticmethod
+    def _bgr_to_png_bytes(img_bgr: np.ndarray) -> bytes:
+        ok, buf = cv2.imencode(".png", img_bgr)
+        if not ok:
+            raise RuntimeError("Не удалось закодировать PNG.")
+        return buf.tobytes()
+
+    # ---------- public API ----------
+
+    def detect(self, data: bytes, conf: float = 0.3) -> Tuple[bytes, Dict[str, Any]]:
+        """
+        Запускает инференс и возвращает:
+        - annotated_png_bytes: PNG с нарисованными прямоугольниками
+        - detections: JSON со списком найденных боксов
+        """
+        img_bgr = self._bytes_to_bgr(data)
+
+        # Ultralytics принимает numpy в RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        results = self.model.predict(img_rgb, conf=conf, verbose=False)
+
         if not results:
-            return out
-        r = results[0]
-        if r.boxes is None:
-            return out
-        boxes = r.boxes
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-        cls_ids = boxes.cls.cpu().numpy().astype(int)
-        for i in range(len(xyxy)):
-            name = str(self.names.get(int(cls_ids[i]), int(cls_ids[i])))
-            out.append(
-                {
-                    "cls_id": int(cls_ids[i]),
-                    "cls_name": name.lower(),
-                    "score": float(confs[i]),
-                    "xyxy": [float(v) for v in xyxy[i].tolist()],
-                }
-            )
-        return out
+            annotated = img_bgr
+            detections_json: Dict[str, Any] = {"detections": []}
+        else:
+            r = results[0]
+
+            # Картинка с разметкой (BGR)
+            annotated = r.plot()  # already BGR
+
+            det_list: List[Dict[str, Any]] = []
+            boxes = r.boxes  # Boxes object
+            if boxes is not None and len(boxes) > 0:
+                xyxy = boxes.xyxy.cpu().numpy()
+                confs = boxes.conf.cpu().numpy()
+                clss = boxes.cls.cpu().numpy()
+
+                for i in range(xyxy.shape[0]):
+                    x1, y1, x2, y2 = [float(v) for v in xyxy[i]]
+                    score = float(confs[i])
+                    cls_id = int(clss[i]) if not np.isnan(clss[i]) else -1
+                    cls_name = (
+                        self.class_names[cls_id]
+                        if 0 <= cls_id < len(self.class_names)
+                        else str(cls_id)
+                    )
+                    det_list.append(
+                        {
+                            "bbox_xyxy": [x1, y1, x2, y2],
+                            "score": score,
+                            "class_id": cls_id,
+                            "class_name": cls_name,
+                        }
+                    )
+
+            detections_json = {"detections": det_list}
+
+        png_bytes = self._bgr_to_png_bytes(annotated)
+        return png_bytes, detections_json
