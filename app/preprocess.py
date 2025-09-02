@@ -1,17 +1,15 @@
 # app/preprocess.py
 from __future__ import annotations
 import io
-from typing import Optional, Tuple
+import os
+from typing import Tuple, Optional
 
-import cv2
-import fitz  # PyMuPDF
 import numpy as np
+import cv2
 from PIL import Image
+import fitz  # PyMuPDF
 
 
-# ----------------------------
-# чтение PDF/изображений
-# ----------------------------
 def _is_pdf(data: bytes, filename: Optional[str]) -> bool:
     if filename and filename.lower().endswith(".pdf"):
         return True
@@ -20,8 +18,7 @@ def _is_pdf(data: bytes, filename: Optional[str]) -> bool:
 
 def read_image_or_pdf(data: bytes, filename: Optional[str] = None, dpi: int = 300) -> np.ndarray:
     """
-    Возвращает BGR-изображение (np.ndarray, uint8).
-    Если PDF — рендерим 1-ю страницу в заданном DPI.
+    Возвращает BGR изображение. Для PDF рендерим 1-ю страницу с указанным DPI.
     """
     if _is_pdf(data, filename):
         doc = fitz.open(stream=data, filetype="pdf")
@@ -35,109 +32,135 @@ def read_image_or_pdf(data: bytes, filename: Optional[str] = None, dpi: int = 30
     arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("Не удалось прочитать изображение")
+        raise ValueError("read_image_or_pdf: cannot decode")
     return img
 
 
-# ----------------------------
-# утилиты препроцесса
-# ----------------------------
-def _deskew(gray: np.ndarray) -> np.ndarray:
-    """Автоповорот по доминирующим линиям (HoughLines)."""
-    edges = cv2.Canny(gray, 60, 160, apertureSize=3, L2gradient=True)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180.0, threshold=int(0.004 * gray.size))
-    if lines is None:
-        return gray
-
-    angles = []
-    for rho_theta in lines[:500]:
-        rho, theta = rho_theta[0]
-        ang = (theta * 180.0 / np.pi) % 180.0
-        if ang > 90:
-            ang -= 180
-        angles.append(ang)
-
-    if not angles:
-        return gray
-
-    angle = float(np.median(angles))
-    if abs(angle) < 0.3:
-        return gray
-
-    h, w = gray.shape
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-
-def _binarize_for_lines(gray: np.ndarray) -> np.ndarray:
-    """Бинаризация под линии: 255 фон, 0 линии."""
-    gray = cv2.convertScaleAbs(gray, alpha=1.25, beta=0)
-    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 31, 9)
-    inv = 255 - bw
-    inv = cv2.morphologyEx(inv, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-    horiz = cv2.morphologyEx(inv, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (35, 1)))
-    vert  = cv2.morphologyEx(inv, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 35)))
-    lines = cv2.max(horiz, vert)
-    lines = cv2.dilate(lines, np.ones((3, 3), np.uint8), iterations=1)
-    lines = cv2.erode(lines, np.ones((3, 3), np.uint8), iterations=1)
-    return 255 - lines  # фон белый, линии чёрные
-
-
-def _crop_plan_bbox_from_gray(gray: np.ndarray) -> Tuple[int, int, int, int]:
-    """Находим bbox области плана (по маске линий). Возвращает (x0,y0,x1,y1)."""
-    bw_lines = _binarize_for_lines(gray)
-    inv = 255 - bw_lines
-    closed = cv2.morphologyEx(inv, cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)),
-                              iterations=1)
-    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        h, w = gray.shape
-        return 0, 0, w, h
-
-    h, w = gray.shape
-    best = max(cnts, key=cv2.contourArea)
-    x, y, ww, hh = cv2.boundingRect(best)
-    pad = max(5, int(0.01 * max(w, h)))
-    x0 = max(0, x + pad)
-    y0 = max(0, y + pad)
-    x1 = min(w, x + ww - pad)
-    y1 = min(h, y + hh - pad)
-    if x1 - x0 < 50 or y1 - y0 < 50:
-        return 0, 0, w, h
-    return x0, y0, x1, y1
+def _four_point_warp(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    # упорядочиваем вершины
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    (tl, tr, br, bl) = rect
+    widthA = np.hypot(*(br - bl))
+    widthB = np.hypot(*(tr - tl))
+    heightA = np.hypot(*(tr - br))
+    heightB = np.hypot(*(tl - bl))
+    maxW = int(max(widthA, widthB))
+    maxH = int(max(heightA, heightB))
+    dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(img, M, (maxW, maxH), flags=cv2.INTER_CUBIC)
 
 
 def auto_crop_plan(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Кропим исходное BGR-изображение до области плана (без шапок/штампов).
+    Ищем большую прямоугольную область чертежа и выравниваем. Если не нашли — bbox по контенту.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = _deskew(gray)
-    x0, y0, x1, y1 = _crop_plan_bbox_from_gray(gray)
+    edges = cv2.Canny(gray, 60, 160)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), 2)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    H, W = gray.shape
+    best, best_area = None, 0
+    for c in cnts:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            area = cv2.contourArea(approx)
+            if 0.2 * W * H < area < 0.98 * W * H and area > best_area:
+                best = approx.reshape(-1, 2)
+                best_area = area
+
+    if best is not None:
+        return _four_point_warp(img_bgr, best.astype("float32"))
+
+    # fallback: content bbox
+    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    nz = cv2.findNonZero(thr)
+    if nz is None:
+        return img_bgr
+    x, y, w, h = cv2.boundingRect(nz)
+    pad = int(max(W, H) * 0.01)
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
     return img_bgr[y0:y1, x0:x1]
 
 
+def _remove_colored_stamps(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Съедаем цветные печати/подписи (оставляем белым).
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    mask = (hsv[..., 1] > 60) & (hsv[..., 2] > 80)
+    out = img_bgr.copy()
+    out[mask] = (255, 255, 255)
+    return out
+
+
+def binarize_for_lines(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Бинаризация с усилением длинных горизонталей/вертикалей.
+    Возвращаем: фон=255, линии=0.
+    """
+    img_bgr = _remove_colored_stamps(img_bgr)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # выравнивание фона
+    blur = cv2.GaussianBlur(gray, (11, 11), 0)
+    norm = cv2.divide(gray, blur, scale=255)
+
+    bw = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 51, 10)
+    inv = 255 - bw
+
+    H, W = inv.shape
+    S = max(H, W)
+
+    # убираем мелочь (текст), порог по площади
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((inv > 0).astype(np.uint8), connectivity=8)
+    cleaned = np.zeros_like(inv)
+    area_min = max(80, int(0.00005 * (H * W)))
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= area_min:
+            cleaned[labels == i] = 255
+
+    # ядра зависят от размера картинки
+    k_long = max(15, int(0.02 * S))   # длина для вытягивания линий
+    h = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,
+                         cv2.getStructuringElement(cv2.MORPH_RECT, (k_long, 1)))
+    v = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,
+                         cv2.getStructuringElement(cv2.MORPH_RECT, (1, k_long)))
+    lines = cv2.max(h, v)
+
+    # чуть залечим зазоры
+    lines = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+
+    out = 255 - lines
+
+    # debug снимки (по желанию)
+    if os.getenv("DEBUG_PREPROC") == "1":
+        os.makedirs("/tmp/plan_debug", exist_ok=True)
+        cv2.imwrite("/tmp/plan_debug/01_gray.png", gray)
+        cv2.imwrite("/tmp/plan_debug/02_norm.png", norm)
+        cv2.imwrite("/tmp/plan_debug/03_inv.png", inv)
+        cv2.imwrite("/tmp/plan_debug/04_cleaned.png", cleaned)
+        cv2.imwrite("/tmp/plan_debug/05_lines.png", lines)
+        cv2.imwrite("/tmp/plan_debug/06_out.png", out)
+
+    return out
+
+
 def prepare_bytes_for_parser(data: bytes, filename: Optional[str]) -> Tuple[bytes, Tuple[int, int]]:
-    """
-    Полный препроцесс для «классического» парсера:
-      - PDF/JPG → BGR
-      - GRAY → deskew
-      - бинаризация/усиление осевых линий
-      - кроп по области плана
-      - отдаём PNG-байты и размер (w, h)
-    """
-    bgr = read_image_or_pdf(data, filename)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = _deskew(gray)
-
-    # bbox по серому (устойчиво) → применяем к бинарке
-    x0, y0, x1, y1 = _crop_plan_bbox_from_gray(gray)
-    bw_lines = _binarize_for_lines(gray)[y0:y1, x0:x1]
-
-    h, w = bw_lines.shape
-    pil = Image.fromarray(bw_lines)  # L
+    img = read_image_or_pdf(data, filename)
+    img = auto_crop_plan(img)
+    bin_img = binarize_for_lines(img)
+    pil = Image.fromarray(bin_img)  # L
     buf = io.BytesIO()
     pil.save(buf, format="PNG")
-    return buf.getvalue(), (w, h)
+    return buf.getvalue(), (bin_img.shape[1], bin_img.shape[0])
